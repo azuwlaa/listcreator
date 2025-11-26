@@ -7,15 +7,15 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ConversationHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 ADMINS = {123456789, 987654321}  # Replace with your Telegram IDs
 
-LIST_ABOUT = range(1)
+LIST_ABOUT = 1
 DATA_FILE = "data/lists.json"
 
 # ---------------- LOGGING ----------------
@@ -42,36 +42,40 @@ def save_lists(data):
         json.dump(data, f, indent=4)
 
 def get_group_key(update: Update):
-    """Use chat_id as key to separate group/private lists."""
     return str(update.effective_chat.id)
 
-# ---------------- COMMAND HANDLERS ----------------
-
+# ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to **List Creator Bot**! Use /newlist to create a new list or /lists to see all lists.",
+        "👋 Welcome to **List Creator Bot**!\n"
+        "Use /newlist to create a list or /lists to see all lists.",
     )
 
 # ---------------- NEW LIST ----------------
 async def newlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("Usage: /newlist <list name>")
-    list_name = context.args[0].lower()
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data:
-        data[group_key] = {"lists": {}, "selected": None}
-    if list_name in data[group_key]["lists"]:
-        return await update.message.reply_text("❌ List already exists.")
-    context.user_data["new_list_name"] = list_name
-    await update.message.reply_text("What is this list about?")
+        await update.message.reply_text("❌ Usage: /newlist <list name>")
+        return ConversationHandler.END
+    context.user_data["new_list_name"] = context.args[0].lower()
+    await update.message.reply_text("📋 What is this list about? Reply with description.")
     return LIST_ABOUT
 
 async def newlist_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     about_text = update.message.text
-    list_name = context.user_data["new_list_name"]
+    list_name = context.user_data.get("new_list_name")
+    if not list_name:
+        await update.message.reply_text("❌ Something went wrong. Try /newlist again.")
+        return ConversationHandler.END
+
     group_key = get_group_key(update)
     data = load_lists()
+    if group_key not in data:
+        data[group_key] = {"lists": {}, "selected": None}
+
+    if list_name in data[group_key]["lists"]:
+        await update.message.reply_text("❌ List already exists.")
+        return ConversationHandler.END
+
     data[group_key]["lists"][list_name] = {
         "about": about_text,
         "lines": [],
@@ -80,6 +84,7 @@ async def newlist_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     data[group_key]["selected"] = list_name
     save_lists(data)
+
     await update.message.reply_text(f"✅ List '{list_name}' created and selected!")
     return ConversationHandler.END
 
@@ -118,7 +123,7 @@ async def lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        return await update.message.reply_text("Usage: /list <listname>")
+        return await update.message.reply_text("Usage: /list <list name>")
     list_name = context.args[0].lower()
     group_key = get_group_key(update)
     data = load_lists()
@@ -158,8 +163,7 @@ async def rmline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ No list selected.")
     lst_name = data[group_key]["selected"]
     lst = data[group_key]["lists"][lst_name]
-    uid = update.effective_user.id
-    if uid not in ADMINS:
+    if update.effective_user.id not in ADMINS:
         return await update.message.reply_text("❌ Only admins can remove lines.")
     if not context.args:
         return await update.message.reply_text("Usage: /rmline <line#>")
@@ -178,8 +182,7 @@ async def editline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ No list selected.")
     lst_name = data[group_key]["selected"]
     lst = data[group_key]["lists"][lst_name]
-    uid = update.effective_user.id
-    if uid not in ADMINS:
+    if update.effective_user.id not in ADMINS:
         return await update.message.reply_text("❌ Only admins can edit lines.")
     if len(context.args) < 2:
         return await update.message.reply_text("Usage: /editline <line#> <text>")
@@ -221,7 +224,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("newlist", newlist)],
         states={LIST_ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, newlist_about)]},
-        fallbacks=[]
+        fallbacks=[],
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -235,7 +238,7 @@ def main():
     app.add_handler(CommandHandler(["editline", "eline"], editline))
     app.add_handler(CommandHandler("listtype", listtype))
 
-    print("List Creator Bot running…")
+    print("✅ List Creator Bot running…")
     app.run_polling()
 
 if __name__ == "__main__":
