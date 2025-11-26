@@ -1,6 +1,6 @@
-# List Creator - Telegram Bot
+# List Creator Bot
 
-**List Creator** is a Telegram bot to create, manage, and share lists. Admins can control who can add, edit, or remove list items.
+**List Creator Bot** is a Telegram bot to create, manage, and share lists. It works in both **groups** and **private chats**. Admins can control who can add, edit, or remove list items.
 
 ## Features
 
@@ -20,4 +20,4 @@ Admins have full control over lists. Add your Telegram user IDs in `main.py` und
 
 ```bash
 git clone <repo_url>
-cd ListCreator
+cd ListCreatorBot
