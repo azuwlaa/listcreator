@@ -14,13 +14,12 @@ from telegram.ext import (
 from PIL import Image
 import io
 
+# ===== CONFIGURE =====
 BOT_TOKEN = "YOUR_BOT_TOKEN"
 GROUP_ID = -1001956620304   # Group where reports happen
 LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
 
-# -----------------------
-# DATABASE SETUP
-# -----------------------
+# ===== DATABASE =====
 def init_db():
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
@@ -39,12 +38,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-def save_log(reported_by_id, reported_by_name, broken_by, photo_id, group_id):
+def save_log(report_id, report_name, broken_by, photo_id, group_id):
     now = datetime.now()
     date = now.strftime("%Y-%m-%d")
     time = now.strftime("%H:%M:%S")
-
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
     cur.execute("""
@@ -52,15 +49,12 @@ def save_log(reported_by_id, reported_by_name, broken_by, photo_id, group_id):
             reported_by_id, reported_by_name, broken_by,
             photo_file_id, date, time, group_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (reported_by_id, reported_by_name, broken_by, photo_id, date, time, group_id))
+    """, (report_id, report_name, broken_by, photo_id, date, time, group_id))
     conn.commit()
     conn.close()
     return date, time
 
-
-# -----------------------
-# NAME EXTRACTION
-# -----------------------
+# ===== UTILITY =====
 def extract_broken_by(text: str):
     patterns = [
         r"broken\s*by\s*[:\-–=•]*\s*(.+)",
@@ -72,32 +66,27 @@ def extract_broken_by(text: str):
             name = match.group(1).strip()
             name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
             name = re.sub(r"[^\w\s\.\-']", "", name)
-            return name[:40].strip()
+            return name[:50].strip()
     return None
 
-
-# -----------------------
-# DELETE AFTER DELAY
-# -----------------------
-async def delete_after_delay(msg, delay):
-    await asyncio.sleep(delay)
+async def delete_after(msg, delay_s: int):
+    await asyncio.sleep(delay_s)
     try:
         await msg.delete()
     except:
         pass
 
-
-# -----------------------
-# REPORT HANDLER
-# -----------------------
+# ===== HANDLERS =====
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message or message.chat_id != GROUP_ID:
-        return
-    if not message.photo:
+    if not message or message.chat_id != GROUP_ID or not message.photo:
         return
 
-    # Validate image
+    text = message.caption or ""
+    broken_by = extract_broken_by(text)
+    if not broken_by:
+        return
+
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
         bio = io.BytesIO()
@@ -106,32 +95,18 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img = Image.open(bio)
         img.verify()
     except Exception:
-        return  # invalid image
-
-    text = message.caption or ""
-    broken_by = extract_broken_by(text)
-    if not broken_by:
         return
 
     reporter = message.from_user
     photo_id = message.photo[-1].file_id
+    date, time = save_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID)
 
-    date, time = save_log(
-        reporter.id,
-        reporter.full_name,
-        broken_by,
-        photo_id,
-        GROUP_ID
-    )
-
-    # Confirmation in group
-    confirm_msg = await message.reply_text(
+    confirm = await message.reply_text(
         f"✅ Report logged for *{broken_by}*",
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    asyncio.create_task(delete_after_delay(confirm_msg, 5))
+    asyncio.create_task(delete_after(confirm, 5))
 
-    # Send log to channel
     caption = (
         f"*🧹 Broken Glass Report*\n"
         f"• *Reported by:* [{reporter.full_name}](tg://user?id={reporter.id})\n"
@@ -139,6 +114,7 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• *Date:* {date}\n"
         f"• *Time:* {time}"
     )
+
     await context.bot.send_photo(
         chat_id=LOG_CHANNEL_ID,
         photo=photo_id,
@@ -146,18 +122,12 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
-
-# -----------------------
-# /total command
-# -----------------------
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message.chat_id != GROUP_ID:
         return
-
     now = datetime.now()
     month = now.strftime("%Y-%m")
-
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
     cur.execute("""
@@ -167,26 +137,21 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (f"{month}%", GROUP_ID))
     total_broken, reporter_count = cur.fetchone()
     conn.close()
-
-    reply = (
+    await message.reply_text(
         f"*📊 {now.strftime('%B %Y')} Summary*\n"
         f"• *Total broken:* `{total_broken}`\n"
-        f"• *Reported by staff:* `{reporter_count}`"
+        f"• *Reported by staff:* `{reporter_count}`",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
-    await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
-
-# -----------------------
-# MAIN
-# -----------------------
+# ===== MAIN =====
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
-    print("FRC Bot running on Python 3.12 + PTB v20.7")
+    print("FRC Bot running on PTB v21+")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
