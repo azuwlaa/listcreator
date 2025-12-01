@@ -16,8 +16,8 @@ import io
 
 # ===== CONFIGURATION =====
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -100111222333       # Telegram group ID
-LOG_CHANNEL_ID = -100444555666 # Telegram channel ID
+GROUP_ID = -1001956620304   # Group where reports happen
+LOG_CHANNEL_ID = -1003449720539   # Channel where logs goD
 
 # ===== DATABASE =====
 def init_db():
