@@ -56,22 +56,23 @@ def save_log(reporter_id, reporter_name, broken_by, photo_id, group_id):
 
 # ===== HELPER FUNCTIONS =====
 def extract_broken_by(text: str):
-    """
-    Robustly extract 'broken by' name from text.
-    Ignores punctuation, emojis, extra spaces, and capitalization.
-    """
+    """Extract 'broken by' name from text, robustly"""
     if not text:
         return None
     text = text.lower().replace("\n", " ").strip()
     match = re.search(r"broken\s*by\s*[:\-–=•]*\s*([^\n]+)", text, re.IGNORECASE)
     if match:
         name = match.group(1).strip()
-        # Remove trailing punctuation or emojis
         name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
-        # Keep only letters, numbers, spaces, dots, hyphens, apostrophes
         name = re.sub(r"[^\w\s\.\-']", "", name)
         return name[:50].strip()
     return None
+
+def escape_markdown_v2(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2"""
+    if not text:
+        return ""
+    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
 
 async def delete_after(msg, delay_s: int):
     await asyncio.sleep(delay_s)
@@ -91,11 +92,11 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not broken_by:
         return
 
-    # Validate photo using Pillow (PTB v21+)
+    # Validate photo using Pillow
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
         bio = io.BytesIO()
-        await file.download_to_memory(out=bio)  # PTB v21+ requires out=BytesIO
+        await file.download_to_memory(out=bio)
         bio.seek(0)
         img = Image.open(bio)
         img.verify()
@@ -107,9 +108,9 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_id = message.photo[-1].file_id
     date, time = save_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID)
 
-    # Confirmation message
+    # Confirmation message (auto-delete)
     confirm = await message.reply_text(
-        f"✅ Report logged for *{broken_by}*",
+        f"✅ Report logged for *{escape_markdown_v2(broken_by)}*",
         parse_mode=ParseMode.MARKDOWN_V2
     )
     asyncio.create_task(delete_after(confirm, 5))
@@ -117,8 +118,8 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send log to channel
     caption = (
         f"*🧹 Broken Glass Report*\n"
-        f"• *Reported by:* [{reporter.full_name}](tg://user?id={reporter.id})\n"
-        f"• *Broken by:* `{broken_by}`\n"
+        f"• *Reported by:* [{escape_markdown_v2(reporter.full_name)}](tg://user?id={reporter.id})\n"
+        f"• *Broken by:* `{escape_markdown_v2(broken_by)}`\n"
         f"• *Date:* {date}\n"
         f"• *Time:* {time}"
     )
