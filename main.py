@@ -84,15 +84,20 @@ def init_db():
             message_link TEXT
         )
     """)
+    # optional: index for faster queries
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, date)")
     conn.commit()
     conn.close()
 
 # ---------------- HELPERS: SHIFT & LATE ----------------
 def determine_shift_from_time(dt: datetime):
-    # Morning: clock-in before 17:00, Evening: 17:00 and later
-    if dt.hour >= 17:
+    """Determine shift based on clock-in time window."""
+    if 6 <= dt.hour < 11:
+        return "Morning"
+    elif 15 <= dt.hour < 21:
         return "Evening"
-    return "Morning"
+    else:
+        return None  # outside allowed clock-in time
 
 def clock_out_for_shift(shift: str):
     if shift == "Morning":
@@ -103,7 +108,7 @@ def clock_out_for_shift(shift: str):
 def compute_late_minutes(dt: datetime, shift: str) -> int:
     if shift == "Morning":
         ref = dt.replace(hour=8, minute=30, second=0, microsecond=0)
-    else:
+    else:  # Evening
         ref = dt.replace(hour=17, minute=0, second=0, microsecond=0)
     delta = dt - ref
     return max(0, int(delta.total_seconds() // 60))
@@ -126,7 +131,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user_id = int(context.args[0])
         except ValueError:
-            await msg.reply_text("Invalid user id.")
+            await msg.reply_text("Invalid user id. Usage: /add <id> <Full Name>")
             return
         name = " ".join(context.args[1:]) if len(context.args) > 1 else str(user_id)
 
@@ -181,7 +186,6 @@ async def handle_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = msg.from_user
 
-    # allow /clock or EXACT text "at fr"
     if not (msg.text and (msg.text.strip().lower() == "at fr" or msg.text.strip().startswith("/clock"))):
         return
 
@@ -203,6 +207,11 @@ async def handle_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     shift = determine_shift_from_time(now)
+    if not shift:
+        await msg.reply_text("❌ You cannot clock in at this time.")
+        conn.close()
+        return
+
     late_minutes = compute_late_minutes(now, shift)
     clock_in_str = now.strftime("%H:%M")
     clock_out_str = clock_out_for_shift(shift)
@@ -229,7 +238,6 @@ async def handle_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Message link: [Go to message]({link})"
     )
     await context.bot.send_message(LOG_CHANNEL_ID, caption, parse_mode=ParseMode.MARKDOWN)
-
     await msg.reply_text(f"✅ {full_name} clocked in at {clock_in_str} ({shift})")
 
 # ---------------- SICK / OFF ----------------
@@ -240,6 +248,7 @@ async def cmd_sick_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "Sick" if cmd == "sick" else "Off" if cmd == "off" else None
     if not status:
         return
+
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT full_name FROM staff WHERE user_id=?", (user.id,))
@@ -256,7 +265,7 @@ async def cmd_sick_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (user.id, full_name, today, None, None, status, 0))
     conn.commit()
     conn.close()
-    await msg.reply_text(f"✔️ Marked {status} for {full_name} on {today}")
+    await msg.reply_text(f"✅ Marked {status} for {full_name} on {today}")
 
 # ---------------- SHOW (ADMIN ONLY) ----------------
 async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,11 +280,11 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.args:
         try:
             staff_id = int(context.args[0])
-        except:
-            await msg.reply_text("Provide a valid ID or reply to staff message.")
+        except ValueError:
+            await msg.reply_text("Provide a valid Telegram ID or reply to a staff message.")
             return
     else:
-        await msg.reply_text("Reply to staff message or use `/show <id>`.")
+        await msg.reply_text("Reply to the staff message or use `/show <id>`.")
         return
 
     conn = sqlite3.connect(DB_FILE)
@@ -290,10 +299,9 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now = gmt5_now()
     month_prefix = now.strftime("%Y-%m")
-
     cur.execute("""
         SELECT status, COUNT(*), SUM(late_minutes)
-        FROM attendance
+        FROM attendance a
         WHERE user_id=? AND date LIKE ?
         GROUP BY status
     """, (staff_id, f"{month_prefix}%"))
@@ -301,14 +309,17 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cur.execute("""
         SELECT COUNT(*), COALESCE(SUM(late_minutes),0)
-        FROM attendance
+        FROM attendance a
         WHERE user_id=? AND date LIKE ? AND late_minutes>0
     """, (staff_id, f"{month_prefix}%"))
     late_days_count, late_minutes_sum = cur.fetchone() or (0, 0)
     conn.close()
 
-    total_clocked = absent = sick = off = 0
-    for status, count, _ in data:
+    total_clocked = 0
+    absent = 0
+    sick = 0
+    off = 0
+    for status, count, late_sum in data:
         if status == "Clocked In":
             total_clocked = count
         elif status == "Absent":
@@ -318,15 +329,17 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif status == "Off":
             off = count
 
-    txt = (
+    late_hours_str = f"{late_minutes_sum / 60:.1f}h"
+
+    text = (
         f"*Attendance Summary for [{escape_markdown(full_name)}](tg://user?id={staff_id})*\n"
         f"• Total Days Clocked: {total_clocked}\n"
         f"• Absent Days: {absent}\n"
-        f"• Late Days: {late_days_count} (Total Late Minutes: {late_minutes_sum})\n"
+        f"• Late Days: {late_days_count} (Total Late Hours: {late_hours_str})\n"
         f"• Sick Days: {sick}\n"
         f"• Off Days: {off}"
     )
-    await msg.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # ---------------- GLASS REPORTING ----------------
 def extract_broken_by_from_text(text: str):
@@ -343,11 +356,9 @@ async def handle_glass_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = update.message
     if not msg or msg.chat_id != GROUP_ID or not msg.photo:
         return
-
     broken_by = extract_broken_by_from_text(msg.caption or "")
     if not broken_by:
         return
-
     reporter = msg.from_user
     photo_file_id = msg.photo[-1].file_id
 
@@ -357,16 +368,18 @@ async def handle_glass_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         await file.download_to_memory(out=bio)
         bio.seek(0)
         Image.open(bio).verify()
-    except:
+    except Exception:
         return
 
     now = gmt5_now()
     date = now.strftime("%Y-%m-%d")
     time = now.strftime("%H:%M")
-
     link = getattr(msg, "link", None)
     if not link:
-        link = f"https://t.me/c/{str(GROUP_ID)[4:]}/{msg.message_id}"
+        try:
+            link = f"https://t.me/c/{str(GROUP_ID)[4:]}/{msg.message_id}"
+        except:
+            link = "N/A"
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -390,34 +403,31 @@ async def handle_glass_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     await context.bot.send_photo(LOG_CHANNEL_ID, photo=photo_file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
 
-# ---------------- GLASS TOTAL ----------------
+# ---------------- TOTAL (GLASS) WITH BREAKDOWN ----------------
 async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     now = gmt5_now()
     month_prefix = now.strftime("%Y-%m")
-
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-
     cur.execute("""
         SELECT COUNT(*), COUNT(DISTINCT reported_by_id)
         FROM glass_logs
-        WHERE date LIKE ? AND group_id=?
+        WHERE date LIKE ? AND group_id = ?
     """, (f"{month_prefix}%", GROUP_ID))
     total_broken, reporter_count = cur.fetchone()
 
     cur.execute("""
         SELECT reported_by_name, COUNT(*) as c
         FROM glass_logs
-        WHERE date LIKE ? AND group_id=?
+        WHERE date LIKE ? AND group_id = ?
         GROUP BY reported_by_id, reported_by_name
         ORDER BY c DESC
     """, (f"{month_prefix}%", GROUP_ID))
     rows = cur.fetchall()
     conn.close()
 
-    breakdown = "\n".join([f"• {escape_markdown(r[0])}: {r[1]}" for r in rows])
-
+    breakdown = "\n".join([f"• {escape_markdown(r[0])}: {r[1]} report{'s' if r[1] > 1 else ''}" for r in rows])
     text = (
         f"*📊 Glass Break Summary - {now.strftime('%B %Y')}*\n"
         f"• Total broken: {total_broken}\n"
@@ -426,98 +436,91 @@ async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# ---------------- ATTENDANCE REPORT (EXCEL) ----------------
+# ---------------- REPORT: Attendance Excel ----------------
 async def cmd_report_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query(
-        "SELECT date, full_name, status, clock_in, clock_out, late_minutes, user_id "
-        "FROM attendance a LEFT JOIN staff s ON a.user_id = s.user_id",
-        conn
-    )
+    df = pd.read_sql_query("""
+        SELECT 
+            a.date,
+            s.full_name,
+            a.status,
+            a.clock_in,
+            a.clock_out,
+            a.late_minutes,
+            a.user_id
+        FROM attendance a
+        LEFT JOIN staff s ON a.user_id = s.user_id
+    """, conn)
     conn.close()
     if df.empty:
         await msg.reply_text("No attendance data found.")
         return
-
     bio = io.BytesIO()
     bio.name = f"Attendance_{gmt5_now().strftime('%Y-%m')}.xlsx"
     df.to_excel(bio, index=False)
     bio.seek(0)
-
     await msg.reply_document(document=InputFile(bio), filename=bio.name)
 
-# ---------------- RESET COMMANDS ----------------
+# ---------------- RESET COMMANDS (ADMIN ONLY) ----------------
 async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await is_user_admin(context, msg.from_user.id):
-        await msg.reply_text("❌ Only admins can reset history.")
+        await msg.reply_text("❌ Only group admins can reset history.")
         return
-
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("DELETE FROM attendance")
     cur.execute("DELETE FROM glass_logs")
     conn.commit()
     conn.close()
-    await msg.reply_text("✅ All attendance & glass logs cleared.")
+    await msg.reply_text("✅ All attendance and glass logs cleared.")
 
 async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await is_user_admin(context, msg.from_user.id):
-        await msg.reply_text("❌ Only admins can reset attendance.")
+        await msg.reply_text("❌ Only group admins can reset attendance.")
         return
-
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("DELETE FROM attendance")
     conn.commit()
     conn.close()
-    await msg.reply_text("✅ Attendance history reset.")
+    await msg.reply_text("✅ Attendance data cleared (clock-in history reset).")
 
 # ---------------- BOOT / HANDLERS ----------------
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # staff
+    # staff management
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("staff", cmd_staff))
 
-    # clock
+    # clocking
     app.add_handler(CommandHandler("clock", handle_clock))
-
-    # Fixed Regex (safe version)
-    pattern_atfr = re.compile(r"^at fr$", re.IGNORECASE)
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(pattern_atfr) & filters.Chat(GROUP_ID),
-            handle_clock
-        )
-    )
+    app.add_handler(MessageHandler(filters.Regex(r"^at fr$", flags=0) & filters.Chat(GROUP_ID), handle_clock))
 
     # sick / off
     app.add_handler(CommandHandler("sick", cmd_sick_off))
     app.add_handler(CommandHandler("off", cmd_sick_off))
 
-    # show
+    # show (admin)
     app.add_handler(CommandHandler("show", cmd_show))
 
-    # glass reporting
+    # glass reporting (photo messages in group)
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, handle_glass_report))
 
-    # totals
+    # totals and reports
     app.add_handler(CommandHandler("total", cmd_total))
-
-    # attendance excel
     app.add_handler(CommandHandler("report", cmd_report_attendance))
 
     # resets
     app.add_handler(CommandHandler("reset", cmd_reset_all))
     app.add_handler(CommandHandler("reset_clock", cmd_reset_clock))
 
-    print("✅ FRC Bot Running…")
+    print("✅ FRC Bot running (final version).")
     app.run_polling()
 
 if __name__ == "__main__":
