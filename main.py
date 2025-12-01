@@ -2,7 +2,7 @@ import re
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone, time as dt_time
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from PIL import Image
 import io
@@ -50,22 +50,15 @@ def init_db():
 
 # ===== HELPER FUNCTIONS =====
 def gmt5_now():
-    """Return timezone-aware datetime in GMT+5"""
     return datetime.now(timezone.utc) + timedelta(hours=5)
 
-def save_broken_log(reporter_id, reporter_name, broken_by, photo_id, group_id):
-    now = gmt5_now()
-    date = now.strftime("%Y-%m-%d")
-    time = now.strftime("%H:%M:%S")
-    conn = sqlite3.connect("frc_bot.db")
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO broken_logs (reported_by_id, reported_by_name, broken_by, photo_file_id, date, time, group_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (reporter_id, reporter_name, broken_by, photo_id, date, time, group_id))
-    conn.commit()
-    conn.close()
-    return date, time
+def calculate_late(clock_in_str, shift):
+    fmt = "%H:%M:%S"
+    clock_in_time = datetime.strptime(clock_in_str, fmt).time()
+    start_time = dt_time(8, 30) if shift == "morning" else dt_time(17, 0)
+    delta_minutes = (datetime.combine(datetime.min, clock_in_time) -
+                     datetime.combine(datetime.min, start_time)).total_seconds() / 60
+    return max(0, int(delta_minutes))
 
 def extract_broken_by(text: str):
     if not text:
@@ -104,16 +97,18 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reporter = msg.from_user
     photo_id = msg.photo[-1].file_id
-    date, time = save_broken_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID)
+    now = gmt5_now()
+    date, time = now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
+    conn = sqlite3.connect("frc_bot.db")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO broken_logs (reported_by_id, reported_by_name, broken_by, photo_file_id, date, time, group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (reporter.id, reporter.full_name, broken_by, photo_id, date, time, GROUP_ID))
+    conn.commit()
+    conn.close()
+
     confirm = await msg.reply_text(f"✅ Report logged for {broken_by}")
     asyncio.create_task(delete_after(confirm, 5))
-    caption = (
-        f"🧹 Broken Glass Report\n"
-        f"Reported by: {reporter.full_name}\n"
-        f"Broken by: {broken_by}\n"
-        f"Date: {date}\n"
-        f"Time: {time}"
-    )
+    caption = f"🧹 Broken Glass Report\nReported by: {reporter.full_name}\nBroken by: {broken_by}\nDate: {date}\nTime: {time}"
     await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=photo_id, caption=caption)
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,8 +151,7 @@ async def rm_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message:
         user_id = msg.reply_to_message.from_user.id
     else:
-        arg = context.args[0]
-        user_id = int(arg)
+        user_id = int(context.args[0])
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
     cur.execute("DELETE FROM staff WHERE user_id=?", (user_id,))
@@ -192,7 +186,7 @@ async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     now = gmt5_now()
     date_str = now.strftime("%Y-%m-%d")
-    hour_min = now.hour + now.minute/60
+    hour_min = now.hour + now.minute / 60
     if hour_min < 12:
         shift = "morning"
         clock_out_time = dt_time(17, 0)
@@ -205,7 +199,61 @@ async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     confirm = await msg.reply_text(f"✅ {user.full_name} clocked in at {clock_in_time} ({shift})")
-    asyncio.create_task(delete_after(confirm,5))
+    asyncio.create_task(delete_after(confirm, 5))
+    await context.bot.send_message(LOG_CHANNEL_ID, f"🕒 {user.full_name} clocked in at {clock_in_time} ({shift})")
+
+# ===== SHOW STAFF ATTENDANCE =====
+async def show_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not context.args and not msg.reply_to_message:
+        await msg.reply_text("Reply to a user or provide Telegram ID/username.")
+        return
+    if msg.reply_to_message:
+        staff_id = msg.reply_to_message.from_user.id
+    else:
+        staff_id = int(context.args[0])
+
+    conn = sqlite3.connect("frc_bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT date, clock_in, clock_out, shift FROM attendance WHERE staff_id=? ORDER BY date", (staff_id,))
+    rows = cur.fetchall()
+
+    # Absents calculation for current month
+    today = gmt5_now().date()
+    month_start = today.replace(day=1)
+    dates_in_month = [month_start + timedelta(days=i) for i in range(today.day)]
+    present_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+
+    lines = []
+    total_days = len(dates_in_month)
+    present_count = 0
+    for d in dates_in_month:
+        if d in present_dates:
+            idx = present_dates.index(d)
+            clock_in, clock_out, shift = rows[idx][1], rows[idx][2], rows[idx][3]
+            late = calculate_late(clock_in, shift)
+            lines.append(f"{d} - In: {clock_in}, Out: {clock_out}, Shift: {shift}, Late: {late} min")
+            present_count += 1
+        else:
+            lines.append(f"{d} - Absent")
+    conn.close()
+
+    await msg.reply_text(f"📋 Attendance for ID {staff_id} ({present_count}/{total_days} present):\n" + "\n".join(lines))
+
+# ===== REPORT EXCEL =====
+async def report_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    conn = sqlite3.connect("frc_bot.db")
+    broken_df = pd.read_sql_query("SELECT * FROM broken_logs", conn)
+    staff_df = pd.read_sql_query("SELECT * FROM staff", conn)
+    attendance_df = pd.read_sql_query("SELECT * FROM attendance", conn)
+    conn.close()
+    file_path = "/tmp/frc_report.xlsx"
+    with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+        broken_df.to_excel(writer, sheet_name="Broken Glass", index=False)
+        staff_df.to_excel(writer, sheet_name="Staff List", index=False)
+        attendance_df.to_excel(writer, sheet_name="Attendance", index=False)
+    await msg.reply_document(document=InputFile(file_path), filename="frc_report.xlsx")
 
 # ===== RESET HISTORY =====
 async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,11 +271,14 @@ def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Handlers
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
     app.add_handler(CommandHandler("add", add_staff))
     app.add_handler(CommandHandler("rm", rm_staff))
     app.add_handler(CommandHandler("staff", list_staff))
+    app.add_handler(CommandHandler("show", show_staff))
+    app.add_handler(CommandHandler("report", report_excel))
     app.add_handler(MessageHandler(filters.TEXT & filters.Chat(GROUP_ID), clock_in))
     app.add_handler(CommandHandler("reset", reset_history))
 
