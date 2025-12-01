@@ -15,8 +15,8 @@ from PIL import Image
 import io
 
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -1001956620304   # Group where reports happen
-LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
+GROUP_ID = -100111222333       # Telegram group
+LOG_CHANNEL_ID = -100444555666 # Logging channel
 
 
 # -----------------------
@@ -98,16 +98,16 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message.photo:
         return
 
-    # Validate image (replace imghdr)
+    # Validate image
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
         bio = io.BytesIO()
         await file.download(out=bio)
         bio.seek(0)
         img = Image.open(bio)
-        img.verify()  # will raise exception if not image
+        img.verify()
     except Exception:
-        return  # not a valid image
+        return  # invalid image
 
     text = message.caption or ""
     broken_by = extract_broken_by(text)
@@ -125,7 +125,7 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         GROUP_ID
     )
 
-    # Send confirmation in group
+    # Confirmation in group
     confirm_msg = await message.reply_text(
         f"✅ Report logged for *{broken_by}*",
         parse_mode=ParseMode.MARKDOWN_V2
@@ -185,7 +185,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
-    print("FRC Bot running on Python 3.13+")
+    print("FRC Bot running on Python 3.12 + PTB v20.7")
     app.run_polling()
 
 
