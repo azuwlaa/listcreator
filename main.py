@@ -1,32 +1,78 @@
 import re
 import sqlite3
 import asyncio
-from datetime import datetime, timedelta, timezone, time as dt_time
-from telegram import Update
-from telegram.constants import ChatMemberStatus
+from datetime import datetime, timedelta, timezone
+import io
+
+from telegram import Update, InputFile
+from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
     ApplicationBuilder,
-    MessageHandler,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
     filters
 )
-from PIL import Image
-import io
-import pandas as pd
 
-# ===== CONFIGURATION =====
+import pandas as pd
+from PIL import Image
+
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -1001956620304   # Group where reports happen
-LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
+GROUP_ID = -1001956620304    # replace with your group id
+LOG_CHANNEL_ID = -1003449720539  # replace with your logging channel id
 DB_FILE = "frc_bot.db"
 
-# ===== DATABASE =====
+# ---------------- UTILITIES ----------------
+def gmt5_now() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=5)
+
+def escape_markdown(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
+
+async def delete_after(msg, delay_s: int):
+    await asyncio.sleep(delay_s)
+    try:
+        await msg.delete()
+    except:
+        pass
+
+async def is_user_admin(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        mem = await context.bot.get_chat_member(GROUP_ID, user_id)
+        return mem.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except:
+        return False
+
+# ---------------- DATABASE ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
+    # staff
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS broken_logs (
+        CREATE TABLE IF NOT EXISTS staff (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT
+        )
+    """)
+    # attendance
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            full_name TEXT,
+            date TEXT,
+            clock_in TEXT,
+            clock_out TEXT,
+            status TEXT,
+            late_minutes INTEGER
+        )
+    """)
+    # glass logs
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS glass_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             reported_by_id INTEGER,
             reported_by_name TEXT,
@@ -38,268 +84,437 @@ def init_db():
             message_link TEXT
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS staff (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            staff_id INTEGER,
-            date TEXT,
-            clock_in TEXT,
-            clock_out TEXT,
-            shift TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
-# ===== TIME HELPERS =====
-def gmt5_now():
-    return datetime.now(timezone.utc) + timedelta(hours=5)
+# ---------------- HELPERS: SHIFT & LATE ----------------
+def determine_shift_from_time(dt: datetime):
+    # Morning: clock-in before 17:00, Evening: 17:00 and later
+    if dt.hour >= 17:
+        return "Evening"
+    return "Morning"
 
-# ===== HELPER FUNCTIONS =====
-def escape_markdown_v2(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
+def clock_out_for_shift(shift: str):
+    if shift == "Morning":
+        return "17:00"
+    else:
+        return "00:30"
 
-def extract_broken_by(text: str):
+def compute_late_minutes(dt: datetime, shift: str) -> int:
+    if shift == "Morning":
+        ref = dt.replace(hour=8, minute=30, second=0, microsecond=0)
+    else:
+        ref = dt.replace(hour=17, minute=0, second=0, microsecond=0)
+    delta = dt - ref
+    return max(0, int(delta.total_seconds() // 60))
+
+# ---------------- STAFF MANAGEMENT ----------------
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage:
+       - Reply to a user's message: `/add Full Name`
+       - or `/add <telegram_id> Full Name`
+    Admin-only (admins in the group)."""
+    msg = update.message
+    caller_id = msg.from_user.id
+    if not await is_user_admin(context, caller_id):
+        await msg.reply_text("❌ Only group admins can add staff.")
+        return
+
+    if msg.reply_to_message:
+        user_id = msg.reply_to_message.from_user.id
+        name = " ".join(context.args) if context.args else (msg.reply_to_message.from_user.full_name or str(user_id))
+    else:
+        if not context.args:
+            await msg.reply_text("Usage: /add <id> <Full Name>  OR reply to user with `/add <Full Name>`")
+            return
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await msg.reply_text("Invalid user id. Usage: /add <id> <Full Name>")
+            return
+        name = " ".join(context.args[1:]) if len(context.args) > 1 else str(user_id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO staff (user_id, full_name) VALUES (?, ?)", (user_id, name))
+    conn.commit()
+    conn.close()
+    await msg.reply_text(f"✅ Staff added: *{escape_markdown(name)}*", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_rm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply to user or /rm <id>"""
+    msg = update.message
+    caller_id = msg.from_user.id
+    if not await is_user_admin(context, caller_id):
+        await msg.reply_text("❌ Only group admins can remove staff.")
+        return
+
+    if msg.reply_to_message:
+        user_id = msg.reply_to_message.from_user.id
+    elif context.args:
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await msg.reply_text("Invalid user id.")
+            return
+    else:
+        await msg.reply_text("Usage: reply to user with /rm or use /rm <id>")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM staff WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    await msg.reply_text("✅ Staff removed.")
+
+async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, full_name FROM staff ORDER BY full_name COLLATE NOCASE")
+    rows = cur.fetchall()
+    conn.close()
+    lines = []
+    for user_id, full_name in rows:
+        lines.append(f"• **[{escape_markdown(full_name)}](tg://user?id={user_id})**")
+    text = f"*Staff list ({len(rows)} total):*\n" + ("\n".join(lines) if lines else "No staff added yet.")
+    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ---------------- CLOCK / CLOCK COMMAND ----------------
+async def handle_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = msg.from_user
+
+    # allow commands (/clock) or exact text "at fr"
+    if not (msg.text and (msg.text.strip().lower() == "at fr" or msg.text.strip().startswith("/clock"))):
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT full_name FROM staff WHERE user_id=?", (user.id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return  # non-staff silently ignored
+    full_name = row[0]
+    now = gmt5_now()
+    today = now.strftime("%Y-%m-%d")
+
+    # check existing clock-in today
+    cur.execute("SELECT id FROM attendance WHERE user_id=? AND date=? AND status='Clocked In'", (user.id, today))
+    if cur.fetchone():
+        conn.close()
+        await msg.reply_text("❌ You have already clocked in today.")
+        return
+
+    shift = determine_shift_from_time(now)
+    late_minutes = compute_late_minutes(now, shift)
+    clock_in_str = now.strftime("%H:%M")
+    clock_out_str = clock_out_for_shift(shift)
+
+    cur.execute("""
+        INSERT INTO attendance (user_id, full_name, date, clock_in, clock_out, status, late_minutes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user.id, full_name, today, clock_in_str, clock_out_str, "Clocked In", late_minutes))
+    conn.commit()
+    conn.close()
+
+    # send log to channel (no emojis)
+    # try to use message.link if available; fallback to t.me/c/...
+    link = getattr(msg, "link", None)
+    if not link:
+        try:
+            link = f"https://t.me/c/{str(GROUP_ID)[4:]}/{msg.message_id}"
+        except:
+            link = "N/A"
+
+    caption = (
+        "#clock\n"
+        f"• Staff Name: [{escape_markdown(full_name)}](tg://user?id={user.id})\n"
+        f"• Date: {today}\n"
+        f"• Time: {clock_in_str}\n"
+        f"• Message link: [Go to message]({link})"
+    )
+    await context.bot.send_message(LOG_CHANNEL_ID, caption, parse_mode=ParseMode.MARKDOWN)
+
+    # confirmation (do not auto-delete — user asked clock-in stays)
+    await msg.reply_text(f"✅ {full_name} clocked in at {clock_in_str} ({shift})")
+
+# ---------------- SICK / OFF ----------------
+async def cmd_sick_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = msg.from_user
+    cmd = msg.text.split()[0].lstrip("/").lower()  # "sick" or "off"
+    status = "Sick" if cmd == "sick" else "Off" if cmd == "off" else None
+    if not status:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT full_name FROM staff WHERE user_id=?", (user.id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        await msg.reply_text("❌ You are not in staff list.")
+        return
+    full_name = row[0]
+    today = gmt5_now().strftime("%Y-%m-%d")
+    # insert or replace for today
+    cur.execute("""
+        INSERT INTO attendance (user_id, full_name, date, clock_in, clock_out, status, late_minutes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user.id, full_name, today, None, None, status, 0))
+    conn.commit()
+    conn.close()
+    await msg.reply_text(f"✅ Marked {status} for {full_name} on {today}")
+
+# ---------------- SHOW (ADMIN ONLY) ----------------
+async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    caller = msg.from_user
+    if not await is_user_admin(context, caller.id):
+        await msg.reply_text("❌ Only group admins can use /show.")
+        return
+
+    # identify target: reply or id argument
+    if msg.reply_to_message:
+        staff_id = msg.reply_to_message.from_user.id
+    elif context.args:
+        try:
+            staff_id = int(context.args[0])
+        except ValueError:
+            await msg.reply_text("Provide a valid Telegram ID or reply to a staff message.")
+            return
+    else:
+        await msg.reply_text("Reply to the staff message or use `/show <id>`.")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT full_name FROM staff WHERE user_id=?", (staff_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        await msg.reply_text("Staff not found.")
+        return
+    full_name = row[0]
+
+    # Gather stats for current month
+    now = gmt5_now()
+    month_prefix = now.strftime("%Y-%m")
+    cur.execute("""
+        SELECT status, COUNT(*), SUM(late_minutes)
+        FROM attendance
+        WHERE user_id=? AND date LIKE ?
+        GROUP BY status
+    """, (staff_id, f"{month_prefix}%"))
+    data = cur.fetchall()
+
+    # Compute late_days properly (count rows with late_minutes > 0)
+    cur.execute("""
+        SELECT COUNT(*), COALESCE(SUM(late_minutes),0) FROM attendance
+        WHERE user_id=? AND date LIKE ? AND late_minutes>0
+    """, (staff_id, f"{month_prefix}%"))
+    late_days_count, late_minutes_sum = cur.fetchone() or (0, 0)
+    conn.close()
+
+    total_clocked = 0
+    absent = 0
+    sick = 0
+    off = 0
+    for status, count, late_sum in data:
+        if status == "Clocked In":
+            total_clocked = count
+        elif status == "Absent":
+            absent = count
+        elif status == "Sick":
+            sick = count
+        elif status == "Off":
+            off = count
+
+    text = (
+        f"*Attendance Summary for [{escape_markdown(full_name)}](tg://user?id={staff_id})*\n"
+        f"• Total Days Clocked: {total_clocked}\n"
+        f"• Absent Days: {absent}\n"
+        f"• Late Days: {late_days_count} (Total Late Minutes: {late_minutes_sum})\n"
+        f"• Sick Days: {sick}\n"
+        f"• Off Days: {off}"
+    )
+    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ---------------- GLASS REPORTING ----------------
+def extract_broken_by_from_text(text: str):
     if not text:
         return None
     match = re.search(r"broken\s*by\s*[:\-–=•]*\s*([^\n]+)", text, re.IGNORECASE)
     if match:
         name = match.group(1).strip()
         name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
-        name = re.sub(r"[^\w\s\.\-']", "", name)
-        return name[:50].strip()
+        return name[:80]
     return None
 
-async def delete_after(msg, delay_s: int):
-    await asyncio.sleep(delay_s)
-    try:
-        await msg.delete()
-    except:
-        pass
-
-def save_broken_log(reporter_id, reporter_name, broken_by, photo_id, group_id, msg_link):
-    now = gmt5_now()
-    date = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M")
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO broken_logs (
-            reported_by_id, reported_by_name, broken_by,
-            photo_file_id, date, time, group_id, message_link
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (reporter_id, reporter_name, broken_by, photo_id, date, time_str, group_id, msg_link))
-    conn.commit()
-    conn.close()
-    return date, time_str
-
-# ===== HANDLERS =====
-async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_glass_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.chat_id != GROUP_ID or not msg.photo:
         return
-    text = msg.caption or ""
-    broken_by = extract_broken_by(text)
+    broken_by = extract_broken_by_from_text(msg.caption or "")
     if not broken_by:
         return
     reporter = msg.from_user
-    photo_id = msg.photo[-1].file_id
+    photo_file_id = msg.photo[-1].file_id
+
+    # validate image by downloading small amount via get_file; silently ignore if invalid
     try:
-        file = await context.bot.get_file(photo_id)
+        file = await context.bot.get_file(photo_file_id)
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         bio.seek(0)
-        img = Image.open(bio)
-        img.verify()
-    except:
+        Image.open(bio).verify()
+    except Exception:
+        # invalid image or failed to download; ignore
         return
-    msg_link = f"https://t.me/c/{str(GROUP_ID)[4:]}/{msg.message_id}"
-    date, time_str = save_broken_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID, msg_link)
-    confirm = await msg.reply_text(f"Report logged for *{escape_markdown_v2(broken_by)}*", parse_mode="Markdown")
-    asyncio.create_task(delete_after(confirm, 5))
-    caption = (
-        f"*Broken Glass Report*\n"
-        f"Reported by: [{escape_markdown_v2(reporter.full_name)}](tg://user?id={reporter.id})\n"
-        f"Broken by: `{escape_markdown_v2(broken_by)}`\n"
-        f"Date: {date}\n"
-        f"Time: {time_str}\n"
-        f"[Message Link]({msg_link})"
-    )
-    await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=photo_id, caption=caption, parse_mode="Markdown")
 
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.chat_id != GROUP_ID:
-        return
     now = gmt5_now()
-    month = now.strftime("%Y-%m")
+    date = now.strftime("%Y-%m-%d")
+    time = now.strftime("%H:%M")
+    link = getattr(msg, "link", None)
+    if not link:
+        try:
+            link = f"https://t.me/c/{str(GROUP_ID)[4:]}/{msg.message_id}"
+        except:
+            link = "N/A"
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO glass_logs (reported_by_id, reported_by_name, broken_by, photo_file_id, date, time, group_id, message_link)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (reporter.id, reporter.full_name, broken_by, photo_file_id, date, time, GROUP_ID, link))
+    conn.commit()
+    conn.close()
+
+    # confirmation in group (auto-delete after 5s)
+    conf = await msg.reply_text(f"Report logged for *{escape_markdown(broken_by)}*", parse_mode=ParseMode.MARKDOWN)
+    asyncio.create_task(delete_after(conf, 5))
+
+    # send to log channel (no emojis)
+    caption = (
+        "#update\n"
+        f"• Reported by: [{escape_markdown(reporter.full_name)}](tg://user?id={reporter.id})\n"
+        f"• Broken by: `{escape_markdown(broken_by)}`\n"
+        f"• Date: {date}\n"
+        f"• Time: {time}\n"
+        f"• Message link: [Go to message]({link})"
+    )
+    await context.bot.send_photo(LOG_CHANNEL_ID, photo=photo_file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+
+# ---------------- TOTAL (GLASS) WITH BREAKDOWN ----------------
+async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    now = gmt5_now()
+    month_prefix = now.strftime("%Y-%m")
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*), COUNT(DISTINCT reported_by_id)
-        FROM broken_logs
+        FROM glass_logs
         WHERE date LIKE ? AND group_id = ?
-    """, (f"{month}%", GROUP_ID))
+    """, (f"{month_prefix}%", GROUP_ID))
     total_broken, reporter_count = cur.fetchone()
-    conn.close()
-    await msg.reply_text(
-        f"*{now.strftime('%B %Y')} Summary*\n"
-        f"Total broken: `{total_broken}`\n"
-        f"Reported by staff: `{reporter_count}`",
-        parse_mode="Markdown"
-    )
 
-# ===== STAFF MANAGEMENT =====
-async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not context.args and not msg.reply_to_message:
-        await msg.reply_text("Provide user ID or reply to user, optionally with a name: `/add <id> Name`")
-        return
-    if msg.reply_to_message:
-        user_id = msg.reply_to_message.from_user.id
-        full_name = " ".join(context.args) if context.args else msg.reply_to_message.from_user.full_name
-    else:
-        user_id = int(context.args[0])
-        full_name = " ".join(context.args[1:]) if len(context.args) > 1 else str(user_id)
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO staff(user_id, full_name) VALUES (?, ?)", (user_id, full_name))
-    conn.commit()
-    conn.close()
-    await msg.reply_text(f"Staff *{escape_markdown_v2(full_name)}* added.", parse_mode="Markdown")
-
-async def remove_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not context.args and not msg.reply_to_message:
-        await msg.reply_text("Provide user ID or reply to remove staff.")
-        return
-    user_id = int(context.args[0]) if context.args else msg.reply_to_message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM staff WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-    await msg.reply_text(f"Staff removed.")
-
-async def list_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT full_name, user_id FROM staff")
-    rows = cur.fetchall()
-    conn.close()
-    text = "\n".join([f"{escape_markdown_v2(r[0])} (`{r[1]}`)" for r in rows])
-    await msg.reply_text(f"*Staff list ({len(rows)} total):*\n{text}", parse_mode="Markdown")
-
-# ===== CLOCK-IN =====
-async def clock_in_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    text = msg.text.lower() if msg.text else ""
-    if text != "at fr" and not text.startswith("/clock"):
-        return
-    user = msg.from_user
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM staff WHERE user_id=?", (user.id,))
-    if not cur.fetchone():
-        conn.close()
-        return
-    now = gmt5_now()
-    date_str = now.strftime("%Y-%m-%d")
-    cur.execute("SELECT * FROM attendance WHERE staff_id=? AND date=?", (user.id, date_str))
-    if cur.fetchone():
-        conn.close()
-        await msg.reply_text(f"{user.full_name}, you have already clocked in today.")
-        return
-    hour_min = now.hour + now.minute / 60
-    # Shift detection
-    if hour_min >= 17 or hour_min < 0.5:
-        shift = "evening"
-        clock_out_time = dt_time(0,30)
-    else:
-        shift = "morning"
-        clock_out_time = dt_time(17,0)
-    clock_in_time = now.strftime("%H:%M")
     cur.execute("""
-        INSERT INTO attendance (staff_id, date, clock_in, clock_out, shift)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user.id, date_str, clock_in_time, clock_out_time.strftime("%H:%M"), shift))
-    conn.commit()
-    conn.close()
-    await msg.reply_text(f"{user.full_name} clocked in at {clock_in_time} ({shift})")
-    await context.bot.send_message(LOG_CHANNEL_ID, f"{user.full_name} clocked in at {clock_in_time} ({shift})")
-
-async def show_staff_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not context.args and not msg.reply_to_message:
-        await msg.reply_text("Provide staff ID or reply to their message.")
-        return
-    staff_id = int(context.args[0]) if context.args else msg.reply_to_message.from_user.id
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT full_name FROM staff WHERE user_id=?", (staff_id,))
-    staff = cur.fetchone()
-    if not staff:
-        conn.close()
-        await msg.reply_text("Staff not found.")
-        return
-    cur.execute("SELECT date, clock_in, clock_out, shift FROM attendance WHERE staff_id=?", (staff_id,))
+        SELECT reported_by_name, COUNT(*) as c
+        FROM glass_logs
+        WHERE date LIKE ? AND group_id = ?
+        GROUP BY reported_by_id, reported_by_name
+        ORDER BY c DESC
+    """, (f"{month_prefix}%", GROUP_ID))
     rows = cur.fetchall()
     conn.close()
-    text = "\n".join([f"{r[0]} | {r[1]} - {r[2]} ({r[3]})" for r in rows])
-    await msg.reply_text(f"*Attendance for {escape_markdown_v2(staff[0])}:*\n{text}", parse_mode="Markdown")
 
-# ===== RESET =====
-async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    breakdown = "\n".join([f"• {escape_markdown(r[0])}: {r[1]} report{'s' if r[1] > 1 else ''}" for r in rows])
+    text = (
+        f"*📊 Glass Break Summary - {now.strftime('%B %Y')}*\n"
+        f"• Total broken: {total_broken}\n"
+        f"• Reported by staff: {reporter_count}\n\n"
+        f"*Reporter Breakdown:*\n{breakdown if breakdown else 'No reports this month.'}"
+    )
+    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ---------------- REPORT: Attendance Excel ----------------
+async def cmd_report_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    chat_member = await context.bot.get_chat_member(GROUP_ID, msg.from_user.id)
-    if chat_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-        await msg.reply_text("Only admins can reset.")
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT date, full_name, status, clock_in, clock_out, late_minutes, user_id FROM attendance a LEFT JOIN staff s ON a.user_id = s.user_id", conn)
+    conn.close()
+    if df.empty:
+        await msg.reply_text("No attendance data found.")
+        return
+    bio = io.BytesIO()
+    bio.name = f"Attendance_{gmt5_now().strftime('%Y-%m')}.xlsx"
+    df.to_excel(bio, index=False)
+    bio.seek(0)
+    await msg.reply_document(document=InputFile(bio), filename=bio.name)
+
+# ---------------- RESET COMMANDS (ADMIN ONLY) ----------------
+async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not await is_user_admin(context, msg.from_user.id):
+        await msg.reply_text("❌ Only group admins can reset history.")
         return
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("DELETE FROM broken_logs")
+    cur.execute("DELETE FROM attendance")
+    cur.execute("DELETE FROM glass_logs")
+    conn.commit()
+    conn.close()
+    await msg.reply_text("✅ All attendance and glass logs cleared.")
+
+async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not await is_user_admin(context, msg.from_user.id):
+        await msg.reply_text("❌ Only group admins can reset attendance.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
     cur.execute("DELETE FROM attendance")
     conn.commit()
     conn.close()
-    await msg.reply_text("All history reset.")
-    await context.bot.send_message(LOG_CHANNEL_ID, f"{msg.from_user.full_name} reset all history.")
+    await msg.reply_text("✅ Attendance data cleared (clock-in history reset).")
 
-# ===== REPORT EXCEL =====
-async def report_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM broken_logs", conn)
-    conn.close()
-    file_name = "broken_logs.xlsx"
-    df.to_excel(file_name, index=False)
-    with open(file_name, "rb") as f:
-        await context.bot.send_document(chat_id=msg.chat_id, document=f, filename=file_name)
-
-# ===== MAIN =====
+# ---------------- BOOT / HANDLERS ----------------
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
-    app.add_handler(CommandHandler("total", total))
-    app.add_handler(CommandHandler("add", add_staff))
-    app.add_handler(CommandHandler("rm", remove_staff))
-    app.add_handler(CommandHandler("staff", list_staff))
-    app.add_handler(CommandHandler("show", show_staff_detail))
-    app.add_handler(CommandHandler("reset", reset_history))
-    app.add_handler(CommandHandler("report", report_excel))
-    app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.TEXT, clock_in_user))
-    app.add_handler(CommandHandler("clock", clock_in_user))
+    # staff management
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("rm", cmd_rm))
+    app.add_handler(CommandHandler("staff", cmd_staff))
 
-    print("FRC Bot running...")
+    # clocking
+    app.add_handler(CommandHandler("clock", handle_clock))
+    app.add_handler(MessageHandler(filters.Regex(r"^at fr$", flags=re.IGNORECASE) & filters.Chat(GROUP_ID), handle_clock))
+
+    # sick / off
+    app.add_handler(CommandHandler("sick", cmd_sick_off))
+    app.add_handler(CommandHandler("off", cmd_sick_off))
+
+    # show (admin)
+    app.add_handler(CommandHandler("show", cmd_show))
+
+    # glass reporting (photo messages in group)
+    app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, handle_glass_report))
+
+    # totals and reports
+    app.add_handler(CommandHandler("total", cmd_total))
+    app.add_handler(CommandHandler("report", cmd_report_attendance))
+
+    # resets
+    app.add_handler(CommandHandler("reset", cmd_reset_all))
+    app.add_handler(CommandHandler("reset_clock", cmd_reset_clock))
+
+    print("✅ FRC Bot running (combined final).")
     app.run_polling()
 
 if __name__ == "__main__":
