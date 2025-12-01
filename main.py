@@ -69,9 +69,12 @@ def extract_broken_by(text: str):
     return None
 
 def escape_markdown_v2(text: str) -> str:
-    """Escape special characters for Telegram MarkdownV2"""
+    """Fully escape Telegram MarkdownV2 special characters"""
     if not text:
         return ""
+    # Escape backslash first
+    text = text.replace("\\", "\\\\")
+    # Escape all other MarkdownV2 special characters
     return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
 
 async def delete_after(msg, delay_s: int):
