@@ -108,8 +108,8 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     confirm = await msg.reply_text(f"✅ Report logged for {broken_by}")
     asyncio.create_task(delete_after(confirm, 5))
-    caption = f"🧹 Broken Glass Report\nReported by: {reporter.full_name}\nBroken by: {broken_by}\nDate: {date}\nTime: {time}"
-    await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=photo_id, caption=caption)
+    caption = f"🧹 *Broken Glass Report*\nReported by: {reporter.full_name}\nBroken by: {broken_by}\nDate: {date}\nTime: {time}"
+    await context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=photo_id, caption=caption, parse_mode="Markdown")
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -121,7 +121,7 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (f"{month}%", GROUP_ID))
     total_broken, reporter_count = cur.fetchone()
     conn.close()
-    await msg.reply_text(f"📊 {now.strftime('%B %Y')} Summary\nTotal broken: {total_broken}\nReported by staff: {reporter_count}")
+    await msg.reply_text(f"*📊 {now.strftime('%B %Y')} Summary*\nTotal broken: {total_broken}\nReported by staff: {reporter_count}", parse_mode="Markdown")
 
 # ===== STAFF MANAGEMENT =====
 async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,8 +169,9 @@ async def list_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No staff found.")
         return
-    lines = [f"{r[0]} ({r[1]})" for r in rows]
-    await update.message.reply_text("👥 Staff List:\n" + "\n".join(lines))
+    lines = [f"- {r[0]} (`{r[1]}`)" for r in rows]
+    text = f"*👥 Staff List ({len(rows)} total)*\n" + "\n".join(lines)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ===== CLOCK-IN/OUT =====
 async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,43 +203,71 @@ async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_after(confirm, 5))
     await context.bot.send_message(LOG_CHANNEL_ID, f"🕒 {user.full_name} clocked in at {clock_in_time} ({shift})")
 
-# ===== SHOW STAFF ATTENDANCE =====
+# ===== SHOW STAFF ATTENDANCE (MODERN) =====
 async def show_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not context.args and not msg.reply_to_message:
         await msg.reply_text("Reply to a user or provide Telegram ID/username.")
         return
-    if msg.reply_to_message:
-        staff_id = msg.reply_to_message.from_user.id
-    else:
-        staff_id = int(context.args[0])
 
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
+
+    # Determine staff_id and name
+    if msg.reply_to_message:
+        staff_id = msg.reply_to_message.from_user.id
+        staff_name = msg.reply_to_message.from_user.full_name
+    else:
+        arg = context.args[0]
+        if arg.startswith("@"):
+            cur.execute("SELECT user_id, username FROM staff WHERE username=?", (arg[1:],))
+            result = cur.fetchone()
+            if not result:
+                await msg.reply_text(f"No staff found with username {arg}")
+                conn.close()
+                return
+            staff_id = result[0]
+            staff_name = f"@{result[1]}"
+        else:
+            try:
+                staff_id = int(arg)
+                cur.execute("SELECT username FROM staff WHERE user_id=?", (staff_id,))
+                res = cur.fetchone()
+                staff_name = f"ID {staff_id}" if not res else f"@{res[0]}"
+            except ValueError:
+                await msg.reply_text("Invalid user ID or username.")
+                conn.close()
+                return
+
+    # Fetch attendance
     cur.execute("SELECT date, clock_in, clock_out, shift FROM attendance WHERE staff_id=? ORDER BY date", (staff_id,))
     rows = cur.fetchall()
+    conn.close()
 
-    # Absents calculation for current month
+    if not rows:
+        await msg.reply_text(f"No attendance records found for {staff_name}.")
+        return
+
     today = gmt5_now().date()
     month_start = today.replace(day=1)
     dates_in_month = [month_start + timedelta(days=i) for i in range(today.day)]
-    present_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+    present_dates = {datetime.strptime(r[0], "%Y-%m-%d").date(): r for r in rows}
 
     lines = []
-    total_days = len(dates_in_month)
     present_count = 0
     for d in dates_in_month:
         if d in present_dates:
-            idx = present_dates.index(d)
-            clock_in, clock_out, shift = rows[idx][1], rows[idx][2], rows[idx][3]
+            r = present_dates[d]
+            clock_in, clock_out, shift = r[1], r[2], r[3]
             late = calculate_late(clock_in, shift)
-            lines.append(f"{d} - In: {clock_in}, Out: {clock_out}, Shift: {shift}, Late: {late} min")
+            lines.append(f"*{d.strftime('%a, %d %b')}* — 🟢 In: `{clock_in}` | Out: `{clock_out}` | Shift: {shift} | Late: `{late} min`")
             present_count += 1
         else:
-            lines.append(f"{d} - Absent")
-    conn.close()
+            lines.append(f"*{d.strftime('%a, %d %b')}* — 🔴 Absent")
 
-    await msg.reply_text(f"📋 Attendance for ID {staff_id} ({present_count}/{total_days} present):\n" + "\n".join(lines))
+    header = f"*📋 Attendance for {staff_name}*\nPresent: `{present_count}/{len(dates_in_month)}` days\n"
+    message_text = header + "\n".join(lines)
+    await msg.reply_text(message_text, parse_mode="Markdown")
 
 # ===== REPORT EXCEL =====
 async def report_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
