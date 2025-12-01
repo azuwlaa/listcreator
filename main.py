@@ -1,245 +1,202 @@
-import os
-import json
-import logging
+import re
+import sqlite3
+import asyncio
+from datetime import datetime
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
+    ApplicationBuilder,
     MessageHandler,
-    ConversationHandler,
+    CommandHandler,
     ContextTypes,
-    filters,
+    filters
 )
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-ADMINS = {123456789, 987654321}  # Replace with your Telegram IDs
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+GROUP_ID = -100111222333       # Group where staff reports broken glass
+LOG_CHANNEL_ID = -100444555666 # Channel where logs are sent
 
-LIST_ABOUT = 1
-DATA_FILE = "data/lists.json"
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+# =====================================
+# DATABASE SETUP
+# =====================================
+def init_db():
+    conn = sqlite3.connect("frc_bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS broken_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reported_by_id INTEGER,
+            reported_by_name TEXT,
+            broken_by TEXT,
+            photo_file_id TEXT,
+            date TEXT,
+            time TEXT,
+            group_id INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# ---------------- UTILS ----------------
-def ensure_data_file():
-    os.makedirs("data", exist_ok=True)
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "w") as f:
-            json.dump({}, f, indent=4)
 
-def load_lists():
-    ensure_data_file()
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+def save_log(reported_by_id, reported_by_name, broken_by, photo_id, group_id):
+    now = datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    time = now.strftime("%H:%M:%S")
 
-def save_lists(data):
-    ensure_data_file()
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    conn = sqlite3.connect("frc_bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO broken_logs (
+            reported_by_id, reported_by_name, broken_by,
+            photo_file_id, date, time, group_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        reported_by_id, reported_by_name, broken_by,
+        photo_id, date, time, group_id
+    ))
+    conn.commit()
+    conn.close()
 
-def get_group_key(update: Update):
-    return str(update.effective_chat.id)
+    return date, time
 
-# ---------------- START ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to **List Creator Bot**!\n"
-        "Use /newlist to create a list or /lists to see all lists.",
+
+# =====================================
+# NAME EXTRACTION
+# =====================================
+def extract_broken_by(text: str):
+    patterns = [
+        r"broken\s*by\s*[:\-–=•]*\s*(.+)",
+        r"broken[-\s]*by\s*(.+)",
+    ]
+
+    for p in patterns:
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip()
+            name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
+            name = re.sub(r"[^\w\s\.\-']", "", name)
+            return name[:40].strip()
+
+    return None
+
+
+# =====================================
+# DELETE AFTER DELAY
+# =====================================
+async def delete_after_delay(msg, delay):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except:
+        pass
+
+
+# =====================================
+# REPORT HANDLER
+# =====================================
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if not message or message.chat_id != GROUP_ID:
+        return
+
+    if not message.photo:
+        return
+
+    text = message.caption or ""
+    broken_by = extract_broken_by(text)
+
+    if not broken_by:
+        return
+
+    reporter = message.from_user
+    photo_id = message.photo[-1].file_id
+
+    date, time = save_log(
+        reporter.id,
+        reporter.full_name,
+        broken_by,
+        photo_id,
+        GROUP_ID
     )
 
-# ---------------- NEW LIST ----------------
-async def newlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /newlist <list name>")
-        return ConversationHandler.END
-    context.user_data["new_list_name"] = context.args[0].lower()
-    await update.message.reply_text("📋 What is this list about? Reply with description.")
-    return LIST_ABOUT
+    confirm_msg = await message.reply_text(
+        f"✅ Report logged for *{broken_by}*",
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
 
-async def newlist_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    about_text = update.message.text
-    list_name = context.user_data.get("new_list_name")
-    if not list_name:
-        await update.message.reply_text("❌ Something went wrong. Try /newlist again.")
-        return ConversationHandler.END
+    asyncio.create_task(delete_after_delay(confirm_msg, 5))
 
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data:
-        data[group_key] = {"lists": {}, "selected": None}
+    caption = (
+        f"*🧹 Broken Glass Report*\n"
+        f"• *Reported by:* [{reporter.full_name}](tg://user?id={reporter.id})\n"
+        f"• *Broken by:* `{broken_by}`\n"
+        f"• *Date:* {date}\n"
+        f"• *Time:* {time}"
+    )
 
-    if list_name in data[group_key]["lists"]:
-        await update.message.reply_text("❌ List already exists.")
-        return ConversationHandler.END
+    await context.bot.send_photo(
+        chat_id=LOG_CHANNEL_ID,
+        photo=photo_id,
+        caption=caption,
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
 
-    data[group_key]["lists"][list_name] = {
-        "about": about_text,
-        "lines": [],
-        "allow_members": False,
-        "max_member_lines": 1
-    }
-    data[group_key]["selected"] = list_name
-    save_lists(data)
 
-    await update.message.reply_text(f"✅ List '{list_name}' created and selected!")
-    return ConversationHandler.END
+# =====================================
+# COMMAND /total
+# =====================================
+async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
 
-# ---------------- SELECT / UNSELECT ----------------
-async def select_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /select <list name>")
-    list_name = context.args[0].lower()
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or list_name not in data[group_key]["lists"]:
-        return await update.message.reply_text("❌ List not found.")
-    data[group_key]["selected"] = list_name
-    save_lists(data)
-    await update.message.reply_text(f"✅ List '{list_name}' selected.")
+    if message.chat_id != GROUP_ID:
+        return
 
-async def unselect_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data:
-        return await update.message.reply_text("❌ No lists found.")
-    data[group_key]["selected"] = None
-    save_lists(data)
-    await update.message.reply_text("✅ List unselected.")
+    now = datetime.now()
+    month = now.strftime("%Y-%m")
 
-# ---------------- VIEW LISTS ----------------
-async def lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or not data[group_key]["lists"]:
-        return await update.message.reply_text("No lists created yet.")
-    msg = "📃 *Lists:*\n"
-    for name, info in data[group_key]["lists"].items():
-        msg += f"- {name}: {info['about']}\n"
-    await update.message.reply_markdown(msg)
+    conn = sqlite3.connect("frc_bot.db")
+    cur = conn.cursor()
 
-async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /list <list name>")
-    list_name = context.args[0].lower()
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or list_name not in data[group_key]["lists"]:
-        return await update.message.reply_text("❌ List not found.")
-    lst = data[group_key]["lists"][list_name]
-    msg = f"📃 *{list_name}* ({lst['about']}):\n"
-    if not lst["lines"]:
-        msg += "No items yet."
-    else:
-        for i, line in enumerate(lst["lines"], 1):
-            msg += f"{i}. {line}\n"
-    await update.message.reply_markdown(msg)
+    cur.execute("""
+        SELECT COUNT(*), COUNT(DISTINCT reported_by_id)
+        FROM broken_logs
+        WHERE date LIKE ? AND group_id = ?
+    """, (f"{month}%", GROUP_ID))
 
-# ---------------- ADD / REMOVE / EDIT ----------------
-async def addline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or not data[group_key]["selected"]:
-        return await update.message.reply_text("❌ No list selected.")
-    lst_name = data[group_key]["selected"]
-    lst = data[group_key]["lists"][lst_name]
-    uid = update.effective_user.id
-    if not lst["allow_members"] and uid not in ADMINS:
-        return await update.message.reply_text("❌ Only admins can add lines.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /addline <line text>")
-    line_text = " ".join(context.args)
-    lst["lines"].append(line_text)
-    save_lists(data)
-    await update.message.reply_text(f"✅ Added line: {line_text}")
+    total_broken, reporter_count = cur.fetchone()
+    conn.close()
 
-async def rmline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or not data[group_key]["selected"]:
-        return await update.message.reply_text("❌ No list selected.")
-    lst_name = data[group_key]["selected"]
-    lst = data[group_key]["lists"][lst_name]
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ Only admins can remove lines.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /rmline <line#>")
-    try:
-        idx = int(context.args[0]) - 1
-        removed = lst["lines"].pop(idx)
-        save_lists(data)
-        await update.message.reply_text(f"✅ Removed line: {removed}")
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Invalid line number.")
+    reply = (
+        f"*📊 {now.strftime('%B %Y')} Summary*\n"
+        f"• *Total broken:* `{total_broken}`\n"
+        f"• *Reported by staff:* `{reporter_count}`"
+    )
 
-async def editline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or not data[group_key]["selected"]:
-        return await update.message.reply_text("❌ No list selected.")
-    lst_name = data[group_key]["selected"]
-    lst = data[group_key]["lists"][lst_name]
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ Only admins can edit lines.")
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /editline <line#> <text>")
-    try:
-        idx = int(context.args[0]) - 1
-        new_text = " ".join(context.args[1:])
-        old = lst["lines"][idx]
-        lst["lines"][idx] = new_text
-        save_lists(data)
-        await update.message.reply_text(f"✅ Replaced '{old}' with '{new_text}'")
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Invalid line number.")
+    await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
-# ---------------- LISTTYPE ----------------
-async def listtype(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /listtype on/off")
-    group_key = get_group_key(update)
-    data = load_lists()
-    if group_key not in data or not data[group_key]["selected"]:
-        return await update.message.reply_text("❌ No list selected.")
-    lst_name = data[group_key]["selected"]
-    lst = data[group_key]["lists"][lst_name]
-    arg = context.args[0].lower()
-    if arg in ["on", "yes"]:
-        lst["allow_members"] = True
-    elif arg in ["off", "no"]:
-        lst["allow_members"] = False
-    else:
-        return await update.message.reply_text("Use 'on/yes' or 'off/no'")
-    save_lists(data)
-    await update.message.reply_text(f"✅ List '{lst_name}' type updated. Members can add: {lst['allow_members']}")
 
-# ---------------- MAIN ----------------
+# =====================================
+# MAIN
+# =====================================
 def main():
-    ensure_data_file()
-    app = Application.builder().token(BOT_TOKEN).build()
+    init_db()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("newlist", newlist)],
-        states={LIST_ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, newlist_about)]},
-        fallbacks=[],
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(GROUP_ID) & filters.PHOTO,
+            report_handler
+        )
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("select", select_list))
-    app.add_handler(CommandHandler("unselect", unselect_list))
-    app.add_handler(CommandHandler("lists", lists_command))
-    app.add_handler(CommandHandler(["list", "l"], view_list))
-    app.add_handler(CommandHandler(["addline", "alist"], addline))
-    app.add_handler(CommandHandler("rmline", rmline))
-    app.add_handler(CommandHandler(["editline", "eline"], editline))
-    app.add_handler(CommandHandler("listtype", listtype))
+    app.add_handler(CommandHandler("total", total))
 
-    print("✅ List Creator Bot running…")
+    print("FRC Bot is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
