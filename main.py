@@ -3,7 +3,6 @@ import sqlite3
 import asyncio
 from datetime import datetime
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -68,15 +67,6 @@ def extract_broken_by(text: str):
         return name[:50].strip()
     return None
 
-def escape_markdown_v2(text: str) -> str:
-    """Fully escape Telegram MarkdownV2 special characters"""
-    if not text:
-        return ""
-    # Escape backslash first
-    text = text.replace("\\", "\\\\")
-    # Escape all other MarkdownV2 special characters
-    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
-
 async def delete_after(msg, delay_s: int):
     await asyncio.sleep(delay_s)
     try:
@@ -113,24 +103,22 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Confirmation message (auto-delete)
     confirm = await message.reply_text(
-        f"✅ Report logged for *{escape_markdown_v2(broken_by)}*",
-        parse_mode=ParseMode.MARKDOWN_V2
+        f"✅ Report logged for {broken_by}"
     )
     asyncio.create_task(delete_after(confirm, 5))
 
     # Send log to channel
     caption = (
-        f"*🧹 Broken Glass Report*\n"
-        f"• *Reported by:* [{escape_markdown_v2(reporter.full_name)}](tg://user?id={reporter.id})\n"
-        f"• *Broken by:* `{escape_markdown_v2(broken_by)}`\n"
-        f"• *Date:* {date}\n"
-        f"• *Time:* {time}"
+        f"🧹 Broken Glass Report\n"
+        f"Reported by: {reporter.full_name} (ID: {reporter.id})\n"
+        f"Broken by: {broken_by}\n"
+        f"Date: {date}\n"
+        f"Time: {time}"
     )
     await context.bot.send_photo(
         chat_id=LOG_CHANNEL_ID,
         photo=photo_id,
-        caption=caption,
-        parse_mode=ParseMode.MARKDOWN_V2
+        caption=caption
     )
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,10 +137,9 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_broken, reporter_count = cur.fetchone()
     conn.close()
     await message.reply_text(
-        f"*📊 {now.strftime('%B %Y')} Summary*\n"
-        f"• *Total broken:* `{total_broken}`\n"
-        f"• *Reported by staff:* `{reporter_count}`",
-        parse_mode=ParseMode.MARKDOWN_V2
+        f"📊 {now.strftime('%B %Y')} Summary\n"
+        f"Total broken: {total_broken}\n"
+        f"Reported by staff: {reporter_count}"
     )
 
 # ===== MAIN =====
@@ -164,7 +151,7 @@ def main():
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
 
-    print("✅ FRC Bot running on PTB v21+")
+    print("✅ FRC Bot running (plain text)")
     app.run_polling()
 
 if __name__ == "__main__":
