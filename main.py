@@ -94,7 +94,8 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Validate photo using Pillow (PTB v21+)
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
-        bio = await file.download_to_memory()  # PTB v21+ async API
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)  # PTB v21+ requires out=BytesIO
         bio.seek(0)
         img = Image.open(bio)
         img.verify()
