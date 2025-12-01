@@ -87,6 +87,7 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not broken_by:
         return
 
+    # Validate image using Pillow
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
         bio = io.BytesIO()
