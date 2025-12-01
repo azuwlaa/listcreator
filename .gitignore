@@ -1,14 +1,5 @@
-# Python
 __pycache__/
+*.db
+.env
 *.pyc
-*.pyo
-*.pyd
-env/
-venv/
-*.sqlite3
-
-# Data
-data/lists.json
-
-# OS
 .DS_Store
