@@ -2,7 +2,8 @@ import re
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta, timezone, time as dt_time
-from telegram import Update, ChatMemberStatus
+from telegram import Update
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
