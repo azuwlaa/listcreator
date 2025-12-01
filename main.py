@@ -84,7 +84,6 @@ def init_db():
             message_link TEXT
         )
     """)
-    # optional: index for faster queries
     cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, date)")
     conn.commit()
     conn.close()
@@ -248,7 +247,6 @@ async def cmd_sick_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "Sick" if cmd == "sick" else "Off" if cmd == "off" else None
     if not status:
         return
-
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT full_name FROM staff WHERE user_id=?", (user.id,))
@@ -300,26 +298,26 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = gmt5_now()
     month_prefix = now.strftime("%Y-%m")
     cur.execute("""
-        SELECT status, COUNT(*), SUM(late_minutes)
-        FROM attendance a
+        SELECT status, COUNT(*)
+        FROM attendance
         WHERE user_id=? AND date LIKE ?
         GROUP BY status
     """, (staff_id, f"{month_prefix}%"))
     data = cur.fetchall()
 
     cur.execute("""
-        SELECT COUNT(*), COALESCE(SUM(late_minutes),0)
-        FROM attendance a
+        SELECT COUNT(*), COALESCE(SUM(late_minutes),0) FROM attendance
         WHERE user_id=? AND date LIKE ? AND late_minutes>0
     """, (staff_id, f"{month_prefix}%"))
     late_days_count, late_minutes_sum = cur.fetchone() or (0, 0)
+    late_hours = round(late_minutes_sum / 60, 2)
     conn.close()
 
     total_clocked = 0
     absent = 0
     sick = 0
     off = 0
-    for status, count, late_sum in data:
+    for status, count in data:
         if status == "Clocked In":
             total_clocked = count
         elif status == "Absent":
@@ -329,13 +327,11 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif status == "Off":
             off = count
 
-    late_hours_str = f"{late_minutes_sum / 60:.1f}h"
-
     text = (
-        f"*Attendance Summary for [{escape_markdown(full_name)}](tg://user?id={staff_id})*\n"
+        f"*Attendance Summary for {escape_markdown(full_name)}*\n"
         f"• Total Days Clocked: {total_clocked}\n"
         f"• Absent Days: {absent}\n"
-        f"• Late Days: {late_days_count} (Total Late Hours: {late_hours_str})\n"
+        f"• Late Days: {late_days_count} (Total Late Hours: {late_hours})\n"
         f"• Sick Days: {sick}\n"
         f"• Off Days: {off}"
     )
@@ -403,7 +399,7 @@ async def handle_glass_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     await context.bot.send_photo(LOG_CHANNEL_ID, photo=photo_file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
 
-# ---------------- TOTAL (GLASS) WITH BREAKDOWN ----------------
+# ---------------- TOTAL (GLASS) ----------------
 async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     now = gmt5_now()
@@ -441,14 +437,7 @@ async def cmd_report_attendance(update: Update, context: ContextTypes.DEFAULT_TY
     msg = update.message
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("""
-        SELECT 
-            a.date,
-            s.full_name,
-            a.status,
-            a.clock_in,
-            a.clock_out,
-            a.late_minutes,
-            a.user_id
+        SELECT a.date, a.full_name, a.status, a.clock_in, a.clock_out, a.late_minutes, a.user_id
         FROM attendance a
         LEFT JOIN staff s ON a.user_id = s.user_id
     """, conn)
@@ -462,7 +451,7 @@ async def cmd_report_attendance(update: Update, context: ContextTypes.DEFAULT_TY
     bio.seek(0)
     await msg.reply_document(document=InputFile(bio), filename=bio.name)
 
-# ---------------- RESET COMMANDS (ADMIN ONLY) ----------------
+# ---------------- RESET COMMANDS ----------------
 async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await is_user_admin(context, msg.from_user.id):
@@ -474,49 +463,52 @@ async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("DELETE FROM glass_logs")
     conn.commit()
     conn.close()
-    await msg.reply_text("✅ All attendance and glass logs cleared.")
+    await msg.reply_text("✅ All attendance and glass logs reset.")
 
 async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await is_user_admin(context, msg.from_user.id):
-        await msg.reply_text("❌ Only group admins can reset attendance.")
+        await msg.reply_text("❌ Only group admins can reset clock-in data.")
         return
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("DELETE FROM attendance")
+    cur.execute("DELETE FROM attendance WHERE status='Clocked In'")
     conn.commit()
     conn.close()
-    await msg.reply_text("✅ Attendance data cleared (clock-in history reset).")
+    await msg.reply_text("✅ Clock-in data reset.")
 
-# ---------------- BOOT / HANDLERS ----------------
+# ---------------- BOOT ----------------
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # staff management
+    # Staff management
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("staff", cmd_staff))
 
-    # clocking
+    # Clocking
     app.add_handler(CommandHandler("clock", handle_clock))
-    app.add_handler(MessageHandler(filters.Regex(r"^at fr$", flags=0) & filters.Chat(GROUP_ID), handle_clock))
+    app.add_handler(MessageHandler(
+        filters.Regex(re.compile(r"^at fr$", re.IGNORECASE)) & filters.Chat(GROUP_ID),
+        handle_clock
+    ))
 
-    # sick / off
+    # Sick / off
     app.add_handler(CommandHandler("sick", cmd_sick_off))
     app.add_handler(CommandHandler("off", cmd_sick_off))
 
-    # show (admin)
+    # Show / admin
     app.add_handler(CommandHandler("show", cmd_show))
 
-    # glass reporting (photo messages in group)
+    # Glass reporting
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, handle_glass_report))
 
-    # totals and reports
+    # Totals & reports
     app.add_handler(CommandHandler("total", cmd_total))
     app.add_handler(CommandHandler("report", cmd_report_attendance))
 
-    # resets
+    # Resets
     app.add_handler(CommandHandler("reset", cmd_reset_all))
     app.add_handler(CommandHandler("reset_clock", cmd_reset_clock))
 
