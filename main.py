@@ -14,10 +14,10 @@ from telegram.ext import (
 from PIL import Image
 import io
 
-# ===== CONFIGURE =====
+# ===== CONFIGURATION =====
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -1001956620304   # Group where reports happen
-LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
+GROUP_ID = -100111222333       # Telegram group ID
+LOG_CHANNEL_ID = -100444555666 # Telegram channel ID
 
 # ===== DATABASE =====
 def init_db():
@@ -38,7 +38,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_log(report_id, report_name, broken_by, photo_id, group_id):
+def save_log(reporter_id, reporter_name, broken_by, photo_id, group_id):
     now = datetime.now()
     date = now.strftime("%Y-%m-%d")
     time = now.strftime("%H:%M:%S")
@@ -49,24 +49,28 @@ def save_log(report_id, report_name, broken_by, photo_id, group_id):
             reported_by_id, reported_by_name, broken_by,
             photo_file_id, date, time, group_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (report_id, report_name, broken_by, photo_id, date, time, group_id))
+    """, (reporter_id, reporter_name, broken_by, photo_id, date, time, group_id))
     conn.commit()
     conn.close()
     return date, time
 
-# ===== UTILITY =====
+# ===== HELPER FUNCTIONS =====
 def extract_broken_by(text: str):
-    patterns = [
-        r"broken\s*by\s*[:\-–=•]*\s*(.+)",
-        r"broken[-\s]*by\s*(.+)",
-    ]
-    for p in patterns:
-        match = re.search(p, text, re.IGNORECASE)
-        if match:
-            name = match.group(1).strip()
-            name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
-            name = re.sub(r"[^\w\s\.\-']", "", name)
-            return name[:50].strip()
+    """
+    Robustly extract 'broken by' name from text.
+    Ignores punctuation, emojis, extra spaces, and capitalization.
+    """
+    if not text:
+        return None
+    text = text.lower().replace("\n", " ").strip()
+    match = re.search(r"broken\s*by\s*[:\-–=•]*\s*([^\n]+)", text, re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        # Remove trailing punctuation or emojis
+        name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
+        # Keep only letters, numbers, spaces, dots, hyphens, apostrophes
+        name = re.sub(r"[^\w\s\.\-']", "", name)
+        return name[:50].strip()
     return None
 
 async def delete_after(msg, delay_s: int):
@@ -79,7 +83,11 @@ async def delete_after(msg, delay_s: int):
 # ===== HANDLERS =====
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message or message.chat_id != GROUP_ID or not message.photo:
+    if not message:
+        return
+    if message.chat_id != GROUP_ID:
+        return
+    if not message.photo:
         return
 
     text = message.caption or ""
@@ -87,7 +95,7 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not broken_by:
         return
 
-    # Validate image using Pillow
+    # Validate photo using Pillow
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
         bio = io.BytesIO()
@@ -95,19 +103,22 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio.seek(0)
         img = Image.open(bio)
         img.verify()
-    except Exception:
+    except Exception as e:
+        print(f"Invalid image: {e}")
         return
 
     reporter = message.from_user
     photo_id = message.photo[-1].file_id
     date, time = save_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID)
 
+    # Confirmation message
     confirm = await message.reply_text(
         f"✅ Report logged for *{broken_by}*",
         parse_mode=ParseMode.MARKDOWN_V2
     )
     asyncio.create_task(delete_after(confirm, 5))
 
+    # Send log to channel
     caption = (
         f"*🧹 Broken Glass Report*\n"
         f"• *Reported by:* [{reporter.full_name}](tg://user?id={reporter.id})\n"
@@ -115,7 +126,6 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• *Date:* {date}\n"
         f"• *Time:* {time}"
     )
-
     await context.bot.send_photo(
         chat_id=LOG_CHANNEL_ID,
         photo=photo_id,
@@ -145,13 +155,25 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
+# ===== DEBUG HANDLER (optional) =====
+async def debug_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg:
+        print(f"Received message from {msg.from_user.full_name}: {msg.text or 'PHOTO/NO CAPTION'}")
+
 # ===== MAIN =====
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Log every message for debugging
+    # app.add_handler(MessageHandler(filters.Chat(GROUP_ID), debug_messages))
+
+    # Report handler
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
-    print("FRC Bot running on PTB v21+")
+
+    print("✅ FRC Bot running on PTB v21+")
     app.run_polling()
 
 if __name__ == "__main__":
