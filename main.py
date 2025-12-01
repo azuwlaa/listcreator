@@ -17,7 +17,7 @@ import io
 # ===== CONFIGURATION =====
 BOT_TOKEN = "YOUR_BOT_TOKEN"
 GROUP_ID = -1001956620304   # Group where reports happen
-LOG_CHANNEL_ID = -1003449720539   # Channel where logs goD
+LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
 
 # ===== DATABASE =====
 def init_db():
@@ -83,11 +83,7 @@ async def delete_after(msg, delay_s: int):
 # ===== HANDLERS =====
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message:
-        return
-    if message.chat_id != GROUP_ID:
-        return
-    if not message.photo:
+    if not message or message.chat_id != GROUP_ID or not message.photo:
         return
 
     text = message.caption or ""
@@ -95,11 +91,10 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not broken_by:
         return
 
-    # Validate photo using Pillow
+    # Validate photo using Pillow (PTB v21+)
     try:
         file = await context.bot.get_file(message.photo[-1].file_id)
-        bio = io.BytesIO()
-        await file.download(out=bio)
+        bio = await file.download_to_memory()  # PTB v21+ async API
         bio.seek(0)
         img = Image.open(bio)
         img.verify()
@@ -155,19 +150,10 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
-# ===== DEBUG HANDLER (optional) =====
-async def debug_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg:
-        print(f"Received message from {msg.from_user.full_name}: {msg.text or 'PHOTO/NO CAPTION'}")
-
 # ===== MAIN =====
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Log every message for debugging
-    # app.add_handler(MessageHandler(filters.Chat(GROUP_ID), debug_messages))
 
     # Report handler
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
