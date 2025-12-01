@@ -1,25 +1,17 @@
 import re
 import sqlite3
-import asyncio
 from datetime import datetime
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters
-)
+from telegram import Bot, Update, ParseMode
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -100111222333       # Group where staff reports broken glass
-LOG_CHANNEL_ID = -100444555666 # Channel where logs are sent
+GROUP_ID = -1001956620304   # Group where reports happen
+LOG_CHANNEL_ID = -1003449720539   # Channel where logs go
 
 
-# =====================================
-# DATABASE SETUP
-# =====================================
+# ------------------------------
+# DATABASE
+# ------------------------------
 def init_db():
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
@@ -51,19 +43,16 @@ def save_log(reported_by_id, reported_by_name, broken_by, photo_id, group_id):
             reported_by_id, reported_by_name, broken_by,
             photo_file_id, date, time, group_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        reported_by_id, reported_by_name, broken_by,
-        photo_id, date, time, group_id
-    ))
+    """, (reported_by_id, reported_by_name, broken_by, photo_id, date, time, group_id))
     conn.commit()
     conn.close()
 
     return date, time
 
 
-# =====================================
+# ------------------------------
 # NAME EXTRACTION
-# =====================================
+# ------------------------------
 def extract_broken_by(text: str):
     patterns = [
         r"broken\s*by\s*[:\-–=•]*\s*(.+)",
@@ -77,28 +66,15 @@ def extract_broken_by(text: str):
             name = re.sub(r"[\*\_\-\.\,\|\•]+$", "", name).strip()
             name = re.sub(r"[^\w\s\.\-']", "", name)
             return name[:40].strip()
-
     return None
 
 
-# =====================================
-# DELETE AFTER DELAY
-# =====================================
-async def delete_after_delay(msg, delay):
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except:
-        pass
-
-
-# =====================================
+# ------------------------------
 # REPORT HANDLER
-# =====================================
-async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------------------
+def report_handler(update: Update, context: CallbackContext):
     message = update.message
-
-    if not message or message.chat_id != GROUP_ID:
+    if not message or message.chat.id != GROUP_ID:
         return
 
     if not message.photo:
@@ -106,7 +82,6 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = message.caption or ""
     broken_by = extract_broken_by(text)
-
     if not broken_by:
         return
 
@@ -121,13 +96,11 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         GROUP_ID
     )
 
-    confirm_msg = await message.reply_text(
-        f"✅ Report logged for *{broken_by}*",
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
+    # Send confirmation message and delete after 5s
+    confirm = message.reply_text(f"✅ Report logged for *{broken_by}*", parse_mode=ParseMode.MARKDOWN)
+    context.job_queue.run_once(lambda ctx: confirm.delete(), 5)
 
-    asyncio.create_task(delete_after_delay(confirm_msg, 5))
-
+    # Send log to channel
     caption = (
         f"*🧹 Broken Glass Report*\n"
         f"• *Reported by:* [{reporter.full_name}](tg://user?id={reporter.id})\n"
@@ -135,22 +108,15 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• *Date:* {date}\n"
         f"• *Time:* {time}"
     )
-
-    await context.bot.send_photo(
-        chat_id=LOG_CHANNEL_ID,
-        photo=photo_id,
-        caption=caption,
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
+    context.bot.send_photo(chat_id=LOG_CHANNEL_ID, photo=photo_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
 
 
-# =====================================
-# COMMAND /total
-# =====================================
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------------------
+# /total COMMAND
+# ------------------------------
+def total(update: Update, context: CallbackContext):
     message = update.message
-
-    if message.chat_id != GROUP_ID:
+    if message.chat.id != GROUP_ID:
         return
 
     now = datetime.now()
@@ -158,13 +124,11 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
-
     cur.execute("""
         SELECT COUNT(*), COUNT(DISTINCT reported_by_id)
         FROM broken_logs
         WHERE date LIKE ? AND group_id = ?
     """, (f"{month}%", GROUP_ID))
-
     total_broken, reporter_count = cur.fetchone()
     conn.close()
 
@@ -173,29 +137,23 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• *Total broken:* `{total_broken}`\n"
         f"• *Reported by staff:* `{reporter_count}`"
     )
+    message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
-    await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
-
-# =====================================
+# ------------------------------
 # MAIN
-# =====================================
+# ------------------------------
 def main():
     init_db()
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    dp.add_handler(MessageHandler(Filters.chat(GROUP_ID) & Filters.photo, report_handler))
+    dp.add_handler(CommandHandler("total", total))
 
-    app.add_handler(
-        MessageHandler(
-            filters.Chat(GROUP_ID) & filters.PHOTO,
-            report_handler
-        )
-    )
-
-    app.add_handler(CommandHandler("total", total))
-
-    print("FRC Bot is running...")
-    app.run_polling()
+    print("FRC Bot running on PTB v13...")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
