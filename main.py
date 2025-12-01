@@ -1,10 +1,9 @@
 import re
 import sqlite3
 import asyncio
-from datetime import datetime, timedelta, time as dt_time, date as dt_date
+from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
-from telegram.constants import ParseMode
 from PIL import Image
 import io
 import pandas as pd
@@ -18,7 +17,6 @@ LOG_CHANNEL_ID = -1003449720539 # Logging channel
 def init_db():
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
-    # Broken glass logs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS broken_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,14 +29,12 @@ def init_db():
             group_id INTEGER
         )
     """)
-    # Staff
     cur.execute("""
         CREATE TABLE IF NOT EXISTS staff (
             user_id INTEGER PRIMARY KEY,
             username TEXT
         )
     """)
-    # Attendance
     cur.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
             staff_id INTEGER,
@@ -54,7 +50,8 @@ def init_db():
 
 # ===== HELPER FUNCTIONS =====
 def gmt5_now():
-    return datetime.utcnow() + timedelta(hours=5)
+    """Return timezone-aware datetime in GMT+5"""
+    return datetime.now(timezone.utc) + timedelta(hours=5)
 
 def save_broken_log(reporter_id, reporter_name, broken_by, photo_id, group_id):
     now = gmt5_now()
@@ -88,38 +85,28 @@ async def delete_after(msg, delay_s: int):
     except:
         pass
 
-def staff_is_admin(user_id, chat_id, bot: "telegram.Bot"):
-    # Can be improved with bot.get_chat_member if needed
-    return True  # For now, only implement via admin check in command handlers
-
 # ===== BROKEN GLASS HANDLER =====
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.chat_id != GROUP_ID or not msg.photo:
         return
-
     text = msg.caption or ""
     broken_by = extract_broken_by(text)
     if not broken_by:
         return
-
     try:
         file = await context.bot.get_file(msg.photo[-1].file_id)
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         bio.seek(0)
-        img = Image.open(bio)
-        img.verify()
+        Image.open(bio).verify()
     except:
         return
-
     reporter = msg.from_user
     photo_id = msg.photo[-1].file_id
     date, time = save_broken_log(reporter.id, reporter.full_name, broken_by, photo_id, GROUP_ID)
-
     confirm = await msg.reply_text(f"✅ Report logged for {broken_by}")
     asyncio.create_task(delete_after(confirm, 5))
-
     caption = (
         f"🧹 Broken Glass Report\n"
         f"Reported by: {reporter.full_name}\n"
@@ -147,14 +134,12 @@ async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg.reply_to_message and not context.args:
         await msg.reply_text("Reply to a user or provide Telegram ID/username.")
         return
-
     if msg.reply_to_message:
         user = msg.reply_to_message.from_user
     else:
         arg = context.args[0]
         user_id = int(arg) if arg.isdigit() else None
-        user = type('obj', (object,), {'id': user_id, 'username': arg})()  # dummy
-
+        user = type('obj', (object,), {'id': user_id, 'username': arg})()
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO staff (user_id, username) VALUES (?, ?)", (user.id, getattr(user, 'username', None)))
@@ -196,10 +181,8 @@ async def list_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== CLOCK-IN/OUT =====
 async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    text = msg.text.lower()
-    if "at fr" not in text:
+    if not msg.text or "at fr" not in msg.text.lower():
         return
-
     user = msg.from_user
     conn = sqlite3.connect("frc_bot.db")
     cur = conn.cursor()
@@ -207,14 +190,15 @@ async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cur.fetchone():
         conn.close()
         return
-
     now = gmt5_now()
     date_str = now.strftime("%Y-%m-%d")
-    hour = now.hour + now.minute/60
-
-    # Determine shift
-    shift = "morning" if hour < 12 else "evening"
-    clock_out_time = dt_time(17,0) if shift=="morning" else dt_time(0,30)
+    hour_min = now.hour + now.minute/60
+    if hour_min < 12:
+        shift = "morning"
+        clock_out_time = dt_time(17, 0)
+    else:
+        shift = "evening"
+        clock_out_time = dt_time(0, 30)
     clock_in_time = now.strftime("%H:%M:%S")
     cur.execute("INSERT OR REPLACE INTO attendance (staff_id, date, clock_in, clock_out, shift) VALUES (?, ?, ?, ?, ?)",
                 (user.id, date_str, clock_in_time, clock_out_time.strftime("%H:%M:%S"), shift))
@@ -222,16 +206,6 @@ async def clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     confirm = await msg.reply_text(f"✅ {user.full_name} clocked in at {clock_in_time} ({shift})")
     asyncio.create_task(delete_after(confirm,5))
-
-# ===== SHOW STAFF REPORT =====
-async def show_staff_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Use previous code for /show, including absent/off detection
-    ...
-
-# ===== EXPORT REPORT =====
-async def export_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Use previous code for /report to generate Excel
-    ...
 
 # ===== RESET HISTORY =====
 async def reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,15 +223,12 @@ def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.PHOTO, report_handler))
     app.add_handler(CommandHandler("total", total))
     app.add_handler(CommandHandler("add", add_staff))
     app.add_handler(CommandHandler("rm", rm_staff))
     app.add_handler(CommandHandler("staff", list_staff))
     app.add_handler(MessageHandler(filters.TEXT & filters.Chat(GROUP_ID), clock_in))
-    app.add_handler(CommandHandler("show", show_staff_report))
-    app.add_handler(CommandHandler("report", export_report))
     app.add_handler(CommandHandler("reset", reset_history))
 
     print("✅ FRC Bot running...")
