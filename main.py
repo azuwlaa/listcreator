@@ -18,12 +18,12 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = "YOUR_BOT_TOKEN"
-GROUP_ID = -1001956620304
+GROUP_ID = -1001437300434
 LOG_CHANNEL_ID = -1003449720539
 DB_FILE = "frc_bot.db"
 
 # Telegram IDs of bot admins (for private chat access)
-BOT_ADMINS = [123456789, 987654321]  # replace with actual admin IDs
+BOT_ADMINS = [260161408, 744795573, 624102836]  # replace with actual admin IDs
 
 # ---------------- UTILITIES ----------------
 def gmt5_now() -> datetime:
